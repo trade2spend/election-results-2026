@@ -1,3 +1,5 @@
+<!-- T2S-UAT-20260907-002 | uat.html: free_access lock icon bug — 5 fixes: (1-4) all 4 member fetch calls (fetchTradeAlerts, fetchTrades, fetchUpdates, fetchMarketData fallback) were missing free_access in select query, so free_access=true members saw the premium lock; (5) init() had a race condition — fetched _cachedMember without free_access, then patched it in a separate async call that lost the race with fetchTradeAlerts; fixed by merging free_access+free_access_blocked into the single init query. Rollback: remove free_access from all 5 select queries, remove the 4 direct free_access override lines, restore the separate sbFetch patch block in init(). -->
+<!-- T2S-UAT-20260907-001 | uat.html: stale pending banner fix — when t2s_uat_request_pending=1 but member_id is null, banner now clears immediately on init instead of staying forever. Rollback: remove the !memberId block added before the memberId check. -->
 <!-- T2S-UAT-20260830-003 | uat.html: parseFollowUpContent negation guard — "Will not hold overnight" was incorrectly setting isHolding=true (regex matched "hold overnight" without detecting the "not" before it), causing isTradeFullyClosed() to skip all time-based auto-close conditions and keep the trade open indefinitely. Fix: added _negHoldRe check — only sets isHolding=true when holding regex matches AND no negation phrase ("not/won't/will not/don't/never + hold + overnight/next day/tomorrow") is found. Also updated sbTradeFullyExited() in server.js to detect "not holding overnight" intent so VM stops posting [HIGH:X] after market close. Rollback: remove _negHoldRe declaration and revert the isHolding line back to a bare if(_holdRe.test(text)) check. -->
 <!-- T2S-UAT-20260830-002 | uat.html: fetchUpdates() stale cache fix — changed localStorage key v2→v3 (invalidates old 4-post cache); removed stale-cache renderUpdates() call so loading spinner always shows on first visit, guaranteed fresh fetch with all 49 posts. -->
 <!-- T2S-UAT-20260830-001 | uat.html: fetchUpdates() query fix — replaced single limit=100 all-types query with two parallel targeted queries: (1) general/market_update/banner parent posts (limit 200); (2) all replies (limit 500). Root cause: 172 follow_up replies in last 200 posts were occupying 86% of the 100-slot limit, leaving only ~8 general posts visible out of 49 total. Rollback: revert to single `const posts = await sbFetch('posts?is_deleted=eq.false&order=sent_at.desc&limit=100', ...)`. -->
@@ -2345,8 +2347,8 @@
             memberTier = (window._cachedMember.free_access === true) ? 'paid' : (window._cachedMember.tier || 'free');
         } else if (memberId) {
             try {
-                const _mv = await sbFetch(`members?id=eq.${memberId}&select=tier,is_admin`, { method:'GET' });
-                if (_mv && _mv[0]) { isAdmin = _mv[0].is_admin === true; memberTier = _mv[0].tier || 'free'; }
+                const _mv = await sbFetch(`members?id=eq.${memberId}&select=tier,is_admin,free_access`, { method:'GET' });
+                if (_mv && _mv[0]) { isAdmin = _mv[0].is_admin === true; memberTier = _mv[0].tier || 'free'; if (_mv[0].free_access === true) memberTier = 'paid'; }
             } catch(e) {}
         }
         const canSeePremium = isAdmin || memberTier === 'paid';
@@ -2509,13 +2511,12 @@
             let isAdmin = false;
             let memberTier = 'free';
             if(memberId) {
-                const members = await sbFetch(`members?id=eq.${memberId}&select=tier,is_admin,status`, { method: 'GET' });
+                const members = await sbFetch(`members?id=eq.${memberId}&select=tier,is_admin,status,free_access`, { method: 'GET' });
                 if(members && Array.isArray(members) && members.length > 0) {
                     if(members[0].status === 'disabled') { window.location.href = 'login.html'; return; }
                     isAdmin = members[0].is_admin === true;
                     memberTier = members[0].tier || 'free';
-                    // Use free_access from _cachedMember (populated separately in init, safe if column absent)
-                    if (window._cachedMember && window._cachedMember.free_access === true) memberTier = 'paid';
+                    if (members[0].free_access === true) memberTier = 'paid';
                 }
             }
 
@@ -3759,11 +3760,12 @@
         if (memberId) {
             try {
                 const cached = window._cachedMember;
-                const members = cached ? [cached] : await sbFetch(`members?id=eq.${memberId}&select=tier,is_admin,status`, {method:'GET'});
+                const members = cached ? [cached] : await sbFetch(`members?id=eq.${memberId}&select=tier,is_admin,status,free_access`, {method:'GET'});
                 if (members?.length) {
                     if (members[0].status === 'disabled') { window.location.href='login.html'; return; }
                     isAdmin = members[0].is_admin === true;
                     memberTier = members[0].tier || 'free';
+                    if (members[0].free_access === true) memberTier = 'paid';
                     if (!cached) window._cachedMember = members[0];
                 }
             } catch(e) {}
@@ -4778,13 +4780,12 @@
             let isAdmin    = false;
 
             if(memberId) {
-                const members = await sbFetch(`members?id=eq.${memberId}&select=tier,status,is_admin`, { method: 'GET' });
+                const members = await sbFetch(`members?id=eq.${memberId}&select=tier,status,is_admin,free_access`, { method: 'GET' });
                 if(members && Array.isArray(members) && members.length > 0) {
                     if(members[0].status === 'disabled') { window.location.href = 'login.html'; return; }
                     memberTier = members[0].tier || localStorage.getItem('t2s_uat_mode') || 'free';
                     isAdmin    = members[0].is_admin === true;
-                    // Use free_access from _cachedMember (populated separately in init, safe if column absent)
-                    if (window._cachedMember && window._cachedMember.free_access === true) memberTier = 'paid';
+                    if (members[0].free_access === true) memberTier = 'paid';
                 } else {
                     // Supabase returned no rows — fall back to login-time stored mode
                     memberTier = localStorage.getItem('t2s_uat_mode') || 'free';
@@ -5448,23 +5449,15 @@
         const _mktLoad = fetchMarketData();
         if(mode !== 'free' && memberId){
             try {
-                // Critical auth check — uses only original columns so it works before new SQL is run
-                const members=await sbFetch(`members?id=eq.${memberId}&select=status,tier,is_admin`,{method:'GET'});
+                const members=await sbFetch(`members?id=eq.${memberId}&select=status,tier,is_admin,free_access,free_access_blocked`,{method:'GET'});
                 if(!members||!Array.isArray(members)||!members.length||members[0].status==='disabled'){
                     window.location.href='login.html'; return;
                 }
                 window._cachedMember = members[0];
                 // Render tier chip immediately — before any tab fetch completes
                 _renderMemberChip(members[0]);
-                // Optional: fetch free_access status in a separate call (fails silently if column not yet created)
-                sbFetch(`members?id=eq.${memberId}&select=free_access,free_access_blocked`,{method:'GET'}).then(fa=>{
-                    if(fa&&Array.isArray(fa)&&fa[0]){
-                        window._cachedMember.free_access = fa[0].free_access;
-                        window._cachedMember.free_access_blocked = fa[0].free_access_blocked;
-                        // Silent last_seen ping — feeds free-access inactivity monitor (only after column exists)
-                        sbFetch(`members?id=eq.${memberId}`,{method:'PATCH',body:JSON.stringify({last_seen:new Date().toISOString()})}).catch(()=>{});
-                    }
-                }).catch(()=>{});
+                // Silent last_seen ping — feeds free-access inactivity monitor
+                sbFetch(`members?id=eq.${memberId}`,{method:'PATCH',body:JSON.stringify({last_seen:new Date().toISOString()})}).catch(()=>{});
             } catch(e){ console.warn('Auth check failed',e); }
         }
         // Analytics: session start
@@ -5497,7 +5490,12 @@
             // Ensure chip is shown even if the call inside try{} was a no-op (defensive)
             _renderMemberChip(window._cachedMember);
         }
-        // Verify t2s_uat_request_pending against DB — clears stale flag if request was resolved
+        // Verify t2s_uat_request_pending against DB — clears stale flag if request was resolved or member_id is missing
+        if (localStorage.getItem('t2s_uat_request_pending') === '1' && !memberId) {
+            localStorage.removeItem('t2s_uat_request_pending');
+            const _el = document.getElementById('req-pending-banner');
+            if (_el) _el.remove();
+        }
         if (localStorage.getItem('t2s_uat_request_pending') === '1' && memberId) {
             sbFetch(`access_requests?member_id=eq.${memberId}&order=created_at.desc&limit=1&select=status`, {method:'GET'})
                 .then(rows => {
